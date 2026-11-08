@@ -45,6 +45,18 @@ function readBooleanEnv(key, fallback = false) {
   return ["1", "true", "yes", "on"].includes(raw);
 }
 
+// 批注 2026-11-08：随机唤起支持。给唤醒阈值和检查间隔加抖动，避免"整点打卡"的机械感。
+function randomBetween(min, max) {
+  const lo = Number.isFinite(min) ? min : 0;
+  const hi = Number.isFinite(max) ? max : lo;
+  if (!(hi > lo)) return lo;
+  return lo + Math.random() * (hi - lo);
+}
+
+function isWakeRandomEnabled() {
+  return readBooleanEnv("WAKE_RANDOM_ENABLED", true);
+}
+
 function getDiaryDateString(date = new Date()) {
   const parts = getDatePartsInTimeZone(date, TIME_ZONE);
   return `${parts.year}-${parts.month}-${parts.day}`;
@@ -164,10 +176,30 @@ function isDayTime(date = new Date()) {
   return hour >= start || hour < end;
 }
 
+// 批注 2026-11-08：安静时段。落在这个区间内完全不唤醒（睡觉时间不打扰）。
+// WAKE_QUIET_START_HOUR / WAKE_QUIET_END_HOUR 默认 24 表示关闭；支持跨零点（如 23 → 9）。
+function isQuietHour(date = new Date()) {
+  const start = readNumberEnv("WAKE_QUIET_START_HOUR", 24, { min: 0, max: 24 });
+  const end = readNumberEnv("WAKE_QUIET_END_HOUR", 24, { min: 0, max: 24 });
+  if (start >= 24 || end >= 24 || start === end) return false;
+  const hour = getHourInTimeZone(date, TIME_ZONE);
+  if (start < end) return hour >= start && hour < end;
+  return hour >= start || hour < end;
+}
+
 function getWakeAfterMinutes(date = new Date()) {
-  return isDayTime(date)
+  const isDay = isDayTime(date);
+  const base = isDay
     ? readNumberEnv("DAY_WAKE_AFTER_MINUTES", 60, { min: 1 })
     : readNumberEnv("NIGHT_WAKE_AFTER_MINUTES", 120, { min: 1 });
+  if (!isWakeRandomEnabled()) return base;
+
+  // 批注 2026-11-08：在基数上叠加随机区间，每次检查都重新掷一次，
+  // 于是"多久没说话会被唤醒"变成一个浮动区间，触发时刻自然散开。
+  const spread = isDay
+    ? readNumberEnv("DAY_WAKE_RANDOM_SPREAD_MINUTES", 30, { min: 0 })
+    : readNumberEnv("NIGHT_WAKE_RANDOM_SPREAD_MINUTES", 60, { min: 0 });
+  return Math.round(base + randomBetween(0, spread));
 }
 
 function getCheckIntervalMinutes(date = new Date()) {
@@ -328,8 +360,30 @@ function getLocalTimeString() {
 
 function shouldWake(lastUserTime) {
   const now = getNow();
+  if (isQuietHour(now)) return false;
+
   const diffMinutes = Math.floor((now - new Date(lastUserTime)) / 1000 / 60);
-  return diffMinutes >= getWakeAfterMinutes(now);
+
+  // 批注 2026-11-08：安静时段刚结束时不立刻补发。
+  // 若整段安静期都没说话，把"最后一次说话时间"视作安静期结束时刻，重新计量冷却。
+  const quietEnd = getQuietEndMoment(now);
+  const baseline = quietEnd && new Date(lastUserTime) < quietEnd ? quietEnd : new Date(lastUserTime);
+
+  return Math.floor((now - baseline) / 1000 / 60) >= getWakeAfterMinutes(now);
+}
+
+// 安静时段的结束时刻（今天），用于重置冷却计时；未启用安静时段时返回 null。
+function getQuietEndMoment(date = new Date()) {
+  const start = readNumberEnv("WAKE_QUIET_START_HOUR", 24, { min: 0, max: 24 });
+  const end = readNumberEnv("WAKE_QUIET_END_HOUR", 24, { min: 0, max: 24 });
+  if (start >= 24 || end >= 24 || start === end) return null;
+
+  const parts = getDatePartsInTimeZone(date, TIME_ZONE);
+  const todayQuietEnd = zonedWallTimeToDate(
+    { year: parts.year, month: parts.month, day: parts.day, hour: end, minute: 0 },
+    TIME_ZONE
+  );
+  return todayQuietEnd <= date ? todayQuietEnd : null;
 }
 
 function parseTimelineTimestamp(value) {
@@ -609,7 +663,13 @@ ${historyText}`
 // 从第一个有效坐标开始，所有路径都指向同一处。此阈值已锁定。
 function getCheckIntervalMs() {
   // 批注 2026-06-26：公开版允许用户在管理页调整唤醒检查频率；默认值保持旧版白天10分钟、夜间2小时。
-  return getCheckIntervalMinutes(new Date()) * 60 * 1000;
+  const minutes = getCheckIntervalMinutes(new Date());
+  if (!isWakeRandomEnabled()) return minutes * 60 * 1000;
+
+  // 批注 2026-11-08：检查间隔本身也做百分比抖动，避免每次都卡在同一个节拍上。
+  const jitterPercent = readNumberEnv("WAKE_CHECK_JITTER_PERCENT", 40, { min: 0, max: 80 });
+  const factor = 1 + randomBetween(-jitterPercent / 100, jitterPercent / 100);
+  return Math.max(30_000, Math.round(minutes * 60 * 1000 * factor));
 }
 
 async function scheduleNextCheck() {
@@ -639,6 +699,8 @@ console.log(JSON.stringify({
   target_key_configured: Boolean(process.env.TARGET_API_KEY),
   model_configured: Boolean(process.env.MODEL_NAME),
   push_provider_configured: Boolean(process.env.BARK_KEY || process.env.NTFY_TOPIC),
-  data_dir_ready: fs.existsSync(DATA_DIR)
+  data_dir_ready: fs.existsSync(DATA_DIR),
+  random_wake_enabled: isWakeRandomEnabled()
 }));
 console.log("==================================\n");
+//（注：内容由AI生成）
