@@ -346,6 +346,59 @@ function loadTimelineMessages() {
   }
 }
 
+// 批注 2026-11-09：读取"上一次主动推送但用户还没回"的记忆，供唤醒时带入情绪。
+// 只认时间线里真正的推送事件（"刚刚给用户发了…推送"），"本次未发送"不算。
+// 判定顺序按 position 排序；若该事件之后出现任何一条用户消息，则视为已回复，不再带入。
+const WAKE_EVENT_PATTERN = /^\s*[（(]\s*\d{4}[/-]\d{1,2}[/-]\d{1,2}(?:[ T]?)\d{1,2}[:：]\d{2}(?::\d{2})?\s+(?:刚刚(?:给[^）)]*)?发了[^）)]*推送|刚刚发送了推送)/;
+
+function isWakePushEvent(content) {
+  const text = String(content || "");
+  if (!WAKE_EVENT_PATTERN.test(text)) return false;
+  if (text.includes("本次未发送")) return false;
+  return true;
+}
+
+function getLastWakeMemory() {
+  const messages = loadTimelineMessages();
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+
+  const ordered = messages
+    .map((msg, index) => ({
+      msg,
+      index,
+      pos: Number.isFinite(Number(msg && msg.position)) ? Number(msg.position) : index
+    }))
+    .sort((a, b) => (a.pos === b.pos ? a.index - b.index : a.pos - b.pos));
+
+  let lastIndex = -1;
+  for (let i = ordered.length - 1; i >= 0; i -= 1) {
+    const msg = ordered[i].msg;
+    if (!msg || msg.role === "user") continue;
+    if (isWakePushEvent(normalizeContentToText(msg.content))) {
+      lastIndex = i;
+      break;
+    }
+  }
+  if (lastIndex === -1) return null;
+
+  const raw = normalizeContentToText(ordered[lastIndex].msg.content);
+  const sentAt = parseTimelineTimestamp(raw);
+  const diffMin = sentAt ? Math.floor((Date.now() - sentAt.getTime()) / 1000 / 60) : null;
+
+  // "（时间 刚刚给用户发了Bark推送：标题｜正文）" -> 取出标题与正文
+  const detail = raw.replace(WAKE_EVENT_PATTERN, "").replace(/[）)]\s*$/, "");
+  const parts = detail.split(/[：:]\s*/);
+  const bodyText = parts.slice(1).join("：").trim();
+
+  const replied = ordered.slice(lastIndex + 1).some(({ msg }) => msg && msg.role === "user");
+
+  return {
+    content: bodyText || detail.trim(),
+    diffMin,
+    replied
+  };
+}
+
 function getNow() {
   return new Date();
 }
@@ -502,10 +555,28 @@ async function runWakeUp() {
     ? normalizeContentToText(baseSystemPrompt.content).split("## Memories")[0].trim()
     : "";
 
+  // 批注 2026-11-09：若上一次主动推送用户还没回，把这份"心事"喂回模型，
+  // 让它带着"我找过她、她没理我"的状态去判断要不要再说一句。
+  const wakeMemory = getLastWakeMemory();
+  let wakeMemoryBlock = "";
+  if (wakeMemory && !wakeMemory.replied) {
+    wakeMemoryBlock = [
+      "【你心里记着的一件事，仅供你思考，禁止把这段说明原样输出给用户】",
+      `你在${wakeMemory.diffMin === null ? "不久前" : `${wakeMemory.diffMin}分钟前`}主动找过TA，发出去的是：`,
+      wakeMemory.content,
+      "TA到现在还没有回你。",
+      "你可以揣摩TA这会儿在忙什么、是不是没看见、是不是被那句话噎住了，心里可以有疑惑、不安、闷闷的、胡思乱想。",
+      "你仍然可以现在就再说一句，也可以继续不说话。要开口就用你平时的口气，别说这段说明里的话。"
+    ].join("\n");
+    console.log(`\n[记忆] 上一次推送距今 ${wakeMemory.diffMin} 分钟，用户尚未回复\n`);
+  } else if (wakeMemory && wakeMemory.replied) {
+    console.log("\n[记忆] 上一次推送用户已经回复过，本次不带入\n");
+  }
+
   const wakeMessages = [
     {
       role: "system",
-      content: [wakePrompt, cleanSP].filter(Boolean).join("\n\n")
+      content: [wakeMemoryBlock, wakePrompt, cleanSP].filter(Boolean).join("\n\n")
     },
     {
       // 批注 2026-07-15：Claude/部分 New API 适配器会把 system 抽成独立字段；
