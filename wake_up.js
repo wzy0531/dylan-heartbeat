@@ -399,6 +399,104 @@ function getLastWakeMemory() {
   };
 }
 
+// 批注 2026-11-09：按次计费下的成本闸门。
+// 1) 模型选择沉默后，冷却一段时间不再叫它（避免连续白花钱）
+// 2) 每日调用次数上限，用完就只保留 Bark 通知能力，不再花模型钱
+// 状态存在 DATA_DIR/wake_state.json，重启后仍然有效（挂 Volume 则跨部署保留）。
+const WAKE_STATE_PATH = runtimeFile("wake_state.json");
+
+function todayDateKey() {
+  return formatDateTimeInTimeZone(new Date(), TIME_ZONE).slice(0, 10);
+}
+
+function loadWakeState() {
+  const empty = { date: todayDateKey(), calls: 0, silentUntil: null };
+  try {
+    if (!fs.existsSync(WAKE_STATE_PATH)) return empty;
+    const raw = JSON.parse(fs.readFileSync(WAKE_STATE_PATH, "utf-8"));
+    return {
+      date: typeof raw.date === "string" ? raw.date : empty.date,
+      calls: Number.isFinite(Number(raw.calls)) ? Number(raw.calls) : 0,
+      silentUntil: raw.silentUntil || null
+    };
+  } catch (err) {
+    console.error("读取 wake_state.json 失败，按全新状态处理:", err.message);
+    return empty;
+  }
+}
+
+function saveWakeState(state) {
+  try {
+    fs.writeFileSync(WAKE_STATE_PATH, JSON.stringify(state));
+  } catch (err) {
+    console.error("保存 wake_state.json 失败:", err.message);
+  }
+}
+
+// 冷却期：模型上次选择沉默后，这段时间内不再唤醒模型
+function getSilenceCooldownMinutes() {
+  return readNumberEnv("WAKE_SILENCE_COOLDOWN_MINUTES", 45, { min: 0 });
+}
+
+// 每日最多调用模型几次（0 或负数表示不限）
+function getDailyCallLimit() {
+  return readNumberEnv("WAKE_MAX_CALLS_PER_DAY", 12, { min: 0 });
+}
+
+function checkWakeBudget() {
+  const state = loadWakeState();
+  const today = todayDateKey();
+  if (state.date !== today) {
+    state.date = today;
+    state.calls = 0;
+    state.silentUntil = null;
+    saveWakeState(state);
+  }
+
+  if (state.silentUntil) {
+    const until = new Date(state.silentUntil);
+    if (!Number.isNaN(until.getTime()) && until.getTime() > Date.now()) {
+      const remain = Math.ceil((until.getTime() - Date.now()) / 60000);
+      console.log(`\n[预算] 上次模型选择沉默，冷却中，还剩 ${remain} 分钟\n`);
+      return false;
+    }
+    state.silentUntil = null;
+    saveWakeState(state);
+  }
+
+  const limit = getDailyCallLimit();
+  if (limit > 0 && state.calls >= limit) {
+    console.log(`\n[预算] 今日模型调用已达上限 ${limit} 次，本次不再调用\n`);
+    return false;
+  }
+  return true;
+}
+
+function recordModelCall() {
+  const state = loadWakeState();
+  if (state.date !== todayDateKey()) {
+    state.date = todayDateKey();
+    state.calls = 0;
+    state.silentUntil = null;
+  }
+  state.calls += 1;
+  saveWakeState(state);
+  console.log(`\n[预算] 今日已调用模型 ${state.calls} 次\n`);
+}
+
+function applySilenceCooldown() {
+  const minutes = getSilenceCooldownMinutes();
+  if (!(minutes > 0)) return;
+  const state = loadWakeState();
+  if (state.date !== todayDateKey()) {
+    state.date = todayDateKey();
+    state.calls = state.calls || 0;
+  }
+  state.silentUntil = new Date(Date.now() + minutes * 60 * 1000).toISOString();
+  saveWakeState(state);
+  console.log(`\n[预算] 进入沉默冷却 ${minutes} 分钟\n`);
+}
+
 function getNow() {
   return new Date();
 }
@@ -605,6 +703,9 @@ ${historyText}`
     return;
   }
 
+  // 批注 2026-11-09：真金白银的闸门放在调用上游之前，不通过就不花钱。
+  if (!checkWakeBudget()) return;
+
   const response = await fetch(process.env.TARGET_API_URL, {
     method: "POST",
     // 批注 2026-08-10：上游只建连不结束时，旧循环永远不会安排下一次检查；
@@ -637,6 +738,7 @@ ${historyText}`
   const rawAiText = normalizeContentToText(data.choices?.[0]?.message?.content).trim();
   console.log("\nWake Result Summary:\n");
   console.log(JSON.stringify({ choices: Array.isArray(data.choices) ? data.choices.length : 0, ai_text_chars: rawAiText.length }));
+  recordModelCall();
 
   const diaryResult = extractDiaryFromResponse(rawAiText);
   const diarySaved = appendDiaryEntry(diaryResult.diaryContent);
@@ -646,6 +748,7 @@ ${historyText}`
 
   if (!aiText) {
     console.log("\nAI 未返回推送内容，本次不发送推送\n");
+    applySilenceCooldown();
     eventContent = diarySaved
       ? `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：只写日记）`
       : `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：模型空回复）`;
@@ -654,6 +757,7 @@ ${historyText}`
     const noActionMatch = aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/);
     // AI 选择不发送推送
     console.log("\nAI 选择不发送推送\n");
+    applySilenceCooldown();
     let reason = (noActionMatch[1] || "").trim();
     if (reason.startsWith("原因：") || reason.startsWith("原因:")) {
       reason = reason.replace(/^原因[：:]\s*/, "").trim();
