@@ -852,6 +852,175 @@ function basicAuth(req, reply, done) {
 }
 
 // ========================
+// 唤醒消息只读接口（供客户端/MCP 读取角色主动发过的消息）
+// 批注 2026-11-09：项目原生只推 Bark 通知，消息不会回流到客户端对话；
+// 这里把网关时间线里的"主动推送事件"单独暴露出来，供客户端拉取使用。
+// ========================
+function gatewayOrAdminAuth(req, reply, done) {
+  const auth = req.headers.authorization || "";
+  const [scheme, token] = auth.split(" ");
+  if (scheme === "Bearer" && token && process.env.GATEWAY_API_KEY && token.trim() === process.env.GATEWAY_API_KEY) {
+    done();
+    return;
+  }
+  // 批注 2026-11-09：部分 MCP/数据连接客户端无法自定义请求头，允许用 ?key= 传同一个网关密钥。
+  const queryKey = (req.query && req.query.key) ? String(req.query.key) : "";
+  if (queryKey && process.env.GATEWAY_API_KEY && queryKey === process.env.GATEWAY_API_KEY) {
+    done();
+    return;
+  }
+  basicAuth(req, reply, done);
+}
+
+function collectWakeEvents(timeline, hours = 24, limit = 8) {
+  const since = Date.now() - hours * 3600 * 1000;
+  const found = [];
+  for (const msg of timeline) {
+    const text = normalizeContentToText(msg && msg.content);
+    if (!text.includes("刚刚给用户发了") && !text.includes("自动唤醒：本次未发送推送")) continue;
+    const m = text.match(/(\d{4})-(\d{1,2})-(\d{1,2})\s(\d{1,2}):(\d{2})/);
+    let at = null;
+    if (m) {
+      const parsed = zonedWallTimeToDate({
+        year: m[1], month: m[2], day: m[3], hour: m[4], minute: m[5]
+      }, TIME_ZONE);
+      at = parsed instanceof Date && !Number.isNaN(parsed.getTime()) ? parsed : null;
+    }
+    if (at && at.getTime() < since) continue;
+    if (text.includes("本次未发送推送")) continue;
+    const body = text.replace(/^（/, "").replace(/）$/, "")
+      .replace(/\d{4}-\d{1,2}-\d{1,2}\s\d{1,2}:\d{2}\s*/, "")
+      .replace(/刚刚给用户发了[^：]*推送[:：]/, "")
+      .replace(/自动唤醒[:：]/g, "")
+      .replace(/｜/g, "\n");
+    found.push({
+      time: at ? formatDateTimeInTimeZone(at, TIME_ZONE) : "",
+      at: at ? at.toISOString() : "",
+      content: body.trim()
+    });
+  }
+  found.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  return found.slice(-limit);
+}
+
+function wakeMessagesText(hours, limit) {
+  const events = collectWakeEvents(loadTimeline(), hours, limit);
+  const lines = events.map((e) => `[${e.time}] ${e.content}`);
+  return lines.length
+    ? `以下是角色在过去 ${hours} 小时内主动发给用户的消息（不在当前对话记录里，但确实发送过）：\n` + lines.join("\n\n")
+    : `过去 ${hours} 小时内角色没有主动给用户发过消息。`;
+}
+
+app.get("/timeline/recent", { preHandler: gatewayOrAdminAuth }, async (req, reply) => {
+  const hours = Math.max(1, Math.min(240, Number(req.query?.hours) || 24));
+  const limit = Math.max(1, Math.min(30, Number(req.query?.limit) || 8));
+  const text = wakeMessagesText(hours, limit);
+  if (req.query?.format === "text") {
+    reply.type("text/plain; charset=utf-8").send(text);
+    return;
+  }
+  reply.send({ text, count: collectWakeEvents(loadTimeline(), hours, limit).length });
+});
+
+app.get("/timeline/recent.txt", { preHandler: gatewayOrAdminAuth }, async (req, reply) => {
+  const hours = Math.max(1, Math.min(240, Number(req.query?.hours) || 24));
+  const limit = Math.max(1, Math.min(30, Number(req.query?.limit) || 8));
+  reply.type("text/plain; charset=utf-8").send(wakeMessagesText(hours, limit));
+});
+
+// ========================
+// MCP 服务端（Model Context Protocol，JSON-RPC over HTTP）
+// 批注 2026-11-09：让支持 MCP 的客户端（如 Aru）能读取"角色主动发过的消息"。
+// ========================
+const MCP_PROTOCOL_VERSION = "2025-06-18";
+
+function mcpWakeTool() {
+  return {
+    name: "get_wake_messages",
+    description: "读取角色在过去一段时间内主动推送给用户的消息（心跳唤醒记录）。当用户提起你主动发过的消息、或需要承接一次主动搭话时调用。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        hours: { type: "number", description: "回溯小时数，默认 24，最大 240" },
+        limit: { type: "number", description: "最多返回条数，默认 8，最大 30" }
+      }
+    }
+  };
+}
+
+app.post("/mcp", { preHandler: gatewayOrAdminAuth }, async (req, reply) => {
+  const payload = req.body || {};
+  const method = payload.method;
+  const id = payload.id ?? null;
+  const okReply = (result) => reply.send({ jsonrpc: "2.0", id, result });
+  const errReply = (code, message) => reply.send({ jsonrpc: "2.0", id, error: { code, message } });
+
+  if (method === "initialize") {
+    okReply({
+      protocolVersion: MCP_PROTOCOL_VERSION,
+      capabilities: { tools: {}, resources: {} },
+      serverInfo: { name: "dylan-heartbeat", version: "1.0.0" }
+    });
+    return;
+  }
+  if (typeof method === "string" && method.startsWith("notifications/")) {
+    reply.code(202).send({});
+    return;
+  }
+  if (method === "ping") {
+    okReply({});
+    return;
+  }
+  if (method === "tools/list") {
+    okReply({ tools: [mcpWakeTool()] });
+    return;
+  }
+  if (method === "tools/call") {
+    const toolName = payload.params?.name;
+    if (toolName !== "get_wake_messages") {
+      errReply(-32602, `未知工具：${toolName}`);
+      return;
+    }
+    const rawArgs = payload.params?.arguments || {};
+    const hours = Math.max(1, Math.min(240, Number(rawArgs.hours) || 24));
+    const limit = Math.max(1, Math.min(30, Number(rawArgs.limit) || 8));
+    okReply({ content: [{ type: "text", text: wakeMessagesText(hours, limit) }] });
+    return;
+  }
+  if (method === "resources/list") {
+    okReply({
+      resources: [{ uri: "heartbeat://wake-messages", name: "心跳唤醒记录", description: "角色主动推送给用户的消息", mimeType: "text/plain" }]
+    });
+    return;
+  }
+  if (method === "resources/read") {
+    const uri = payload.params?.uri;
+    if (uri !== "heartbeat://wake-messages") {
+      errReply(-32602, "未知资源");
+      return;
+    }
+    okReply({ contents: [{ uri, mimeType: "text/plain", text: wakeMessagesText(24, 8) }] });
+    return;
+  }
+  if (method === "prompts/list") {
+    okReply({ prompts: [] });
+    return;
+  }
+  errReply(-32601, `不支持的方法：${method}`);
+});
+
+app.get("/mcp", { preHandler: gatewayOrAdminAuth }, async (req, reply) => {
+  reply.send({
+    name: "dylan-heartbeat",
+    protocolVersion: MCP_PROTOCOL_VERSION,
+    transport: "http-post-jsonrpc",
+    tools: ["get_wake_messages"],
+    resources: ["heartbeat://wake-messages"],
+    hint: "以 POST 提交 JSON-RPC 2.0 请求；鉴权使用 Authorization: Bearer <GATEWAY_API_KEY> 或 ?key=<GATEWAY_API_KEY>"
+  });
+});
+
+// ========================
 // 管理页面 GET /admin
 // ========================
 app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
@@ -1770,3 +1939,4 @@ app.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
   }));
   console.log(`✅ Gateway 运行在 ${address}`);
 });
+//（注：内容由AI生成）
