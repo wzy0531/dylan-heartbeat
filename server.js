@@ -525,7 +525,9 @@ app.addHook("onRequest", (req, reply, done) => {
     allowPublicApi: readBooleanEnv("ALLOW_PUBLIC_API", false),
     configuredKey: readEnvValue("GATEWAY_API_KEY"),
     authorization: req.headers.authorization,
-    headerKey
+    headerKey,
+    // 批注 2026-11-09：MCP/数据连接客户端可能无法自定义请求头，允许用 ?key= 传网关密钥。
+    queryKey: req.query && req.query.key
   });
   if (access.allow) return done();
   if (access.authRejected) {

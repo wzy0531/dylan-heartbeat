@@ -19,7 +19,8 @@ function decideRequestAccess({
   allowPublicApi,
   configuredKey,
   authorization,
-  headerKey
+  headerKey,
+  queryKey
 }) {
   const requestPath = String(path || "").split("?")[0];
   // /test-bark 只是穿过网络层，路由本身仍必须通过与管理页相同的 Basic Auth。
@@ -31,11 +32,14 @@ function decideRequestAccess({
     return isLoopbackIp(ip) ? { allow: true } : { allow: false, status: 403, error: "Forbidden" };
   }
 
-  if (allowPublicApi && requestPath.startsWith("/v1/")) {
-    if (!configuredKey) return { allow: false, status: 401, error: "公网 /v1 已开启，但 GATEWAY_API_KEY 未配置", authRejected: true };
+  // 批注 2026-11-09：/mcp 与 /timeline/* 供客户端读取唤醒记录，按与 /v1 相同的网关密钥鉴权后放行。
+  const isGatewayApiPath = requestPath.startsWith("/v1/") || requestPath === "/mcp" || requestPath.startsWith("/timeline/");
+  if (allowPublicApi && isGatewayApiPath) {
+    if (!configuredKey) return { allow: false, status: 401, error: "公网接口已开启，但 GATEWAY_API_KEY 未配置", authRejected: true };
     const bearer = String(authorization || "").match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || "";
     const alternate = String(headerKey || "").trim();
-    if (bearer === configuredKey || alternate === configuredKey) return { allow: true };
+    const fromQuery = String(queryKey || "").trim();
+    if (bearer === configuredKey || alternate === configuredKey || fromQuery === configuredKey) return { allow: true };
     return {
       allow: false,
       status: 401,
@@ -50,3 +54,4 @@ function decideRequestAccess({
 }
 
 module.exports = { decideRequestAccess, isLoopbackIp, isPrivateIp };
+//（注：内容由AI生成）
