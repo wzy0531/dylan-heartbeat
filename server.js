@@ -1011,6 +1011,64 @@ app.post("/mcp", { preHandler: gatewayOrAdminAuth }, async (req, reply) => {
   errReply(-32601, `不支持的方法：${method}`);
 });
 
+// ========================
+// Aru「通过链接安装」用的 manifest：一次输出多种候选格式，用 ?shape= 切换
+// 批注 2026-11-09：Aru 的 manifest 规范未公开，先让同一地址可按 shape 输出不同结构，
+// 便于在不重新部署的前提下逐个试出它认的那一种。
+// ========================
+function buildAruManifest(req) {
+  const base = `https://${req.headers.host || "dylan-heartbeat-production-0c27.up.railway.app"}`;
+  const key = readEnvValue("GATEWAY_API_KEY");
+  const endpoint = `${base}/mcp${key ? `?key=${encodeURIComponent(key)}` : ""}`;
+  const shape = String(req.query?.shape || "1");
+  const name = "dylan-heartbeat";
+  const displayName = "心跳唤醒记录";
+  const description = "读取角色主动推送给用户的消息，用于承接一次主动搭话。";
+
+  if (shape === "2") {
+    return {
+      name,
+      displayName,
+      version: "1.0.0",
+      description,
+      mcpServers: { [name]: { url: endpoint, type: "http", transport: "http" } }
+    };
+  }
+  if (shape === "3") {
+    return {
+      schemaVersion: 1,
+      app: { id: name, name: displayName, version: "1.0.0", description },
+      mcp: { url: endpoint, transport: "http", tools: ["get_wake_messages"] }
+    };
+  }
+  if (shape === "4") {
+    return {
+      manifestVersion: 1,
+      id: name,
+      name: displayName,
+      version: "1.0.0",
+      description,
+      type: "mcp",
+      server: { type: "http", url: endpoint }
+    };
+  }
+  return {
+    version: "0.1",
+    server: {
+      name,
+      displayName,
+      description,
+      url: endpoint,
+      transport: "http",
+      tools: [{ name: "get_wake_messages", description }]
+    }
+  };
+}
+
+app.get("/aru-manifest.json", { preHandler: gatewayOrAdminAuth }, async (req, reply) => {
+  reply.type("application/json; charset=utf-8").send(buildAruManifest(req));
+});
+
 app.get("/mcp", { preHandler: gatewayOrAdminAuth }, async (req, reply) => {
   reply.send({
     name: "dylan-heartbeat",

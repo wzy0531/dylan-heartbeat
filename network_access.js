@@ -33,7 +33,7 @@ function decideRequestAccess({
   }
 
   // 批注 2026-11-09：/mcp 与 /timeline/* 供客户端读取唤醒记录，按与 /v1 相同的网关密钥鉴权后放行。
-  const isGatewayApiPath = requestPath.startsWith("/v1/") || requestPath === "/mcp" || requestPath.startsWith("/timeline/");
+  const isGatewayApiPath = requestPath.startsWith("/v1/") || requestPath === "/mcp" || requestPath.startsWith("/timeline/") || requestPath.startsWith("/aru-");
   if (allowPublicApi && isGatewayApiPath) {
     if (!configuredKey) return { allow: false, status: 401, error: "公网接口已开启，但 GATEWAY_API_KEY 未配置", authRejected: true };
     const bearer = String(authorization || "").match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || "";
